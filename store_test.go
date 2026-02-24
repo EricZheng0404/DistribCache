@@ -9,13 +9,15 @@ import (
 )
 
 func TestPathTransformFuncs(t *testing.T) {
-	key := "momsbestpicture"
-
-	pathKey := CASPathTransformFunc(key)
-	expectedOriginalKey := "6804429f74181a63c50c3d81d733a12f14a353ff"
+	// CASPathTransformFunc now receives an already-computed SHA1 hex digest
+	// and splits it into a hierarchical path. Content hashing happens inside
+	// writeStream/WriteDecrypt, not inside the path-transform function.
+	hash := "6804429f74181a63c50c3d81d733a12f14a353ff" // sha1("momsbestpicture")
 	expectedPath := "68044/29f74/181a6/3c50c/3d81d/733a1/2f14a/353ff"
-	if pathKey.FileName != expectedOriginalKey || pathKey.PathName != expectedPath {
-		t.Errorf("expected %s, got %s", expectedPath, pathKey.PathName)
+
+	pathKey := CASPathTransformFunc(hash)
+	if pathKey.FileName != hash || pathKey.PathName != expectedPath {
+		t.Errorf("expected path %s, got %s", expectedPath, pathKey.PathName)
 	}
 
 }

@@ -7,6 +7,7 @@ to file paths, and it handles metadata for expiry of keys.
 package main
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -15,8 +16,8 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -54,6 +55,8 @@ type StoreOpts struct {
 // Store is responsible for managing file storage.
 type Store struct {
 	StoreOpts
+	keyIndex map[string]string // maps user-supplied key → SHA1 content hash
+	keyMu    sync.RWMutex
 }
 
 // ============================================================================
@@ -92,14 +95,13 @@ func (m *MetaData) isExpired() bool {
 // Path Transform Functions
 // ============================================================================
 
-// CASPathTransformFunc transforms a key into a PathKey using SHA1 hashing.
-// This function is used to create a structured directory layout based on the 
-// hash of the key.
-func CASPathTransformFunc(key string) PathKey {
-	// Implementing key transformation using SHA1.
-	hash := sha1.Sum([]byte(key))
-	hashString := hex.EncodeToString(hash[:]) // Convert to slice [:]
-	blockSize := 5                            // Depth for block
+// CASPathTransformFunc splits an already-computed SHA1 hex digest into a
+// hierarchical directory PathKey (e.g. "abcde/fghij/..."). The SHA1 hash
+// itself is computed from file *content* in writeStream/WriteDecrypt,
+// enabling true content-addressable storage where identical content always
+// maps to the same address regardless of the user-supplied key.
+func CASPathTransformFunc(hashString string) PathKey {
+	blockSize := 5
 	sliceLength := len(hashString) / blockSize
 
 	paths := make([]string, sliceLength)
@@ -138,9 +140,12 @@ func NewStore(storeOpts StoreOpts) *Store {
 			return nil // Handle error appropriately
 		}
 	}
-	return &Store{
+	s := &Store{
 		StoreOpts: storeOpts,
+		keyIndex:  make(map[string]string),
 	}
+	s.loadKeyIndex() // restore key→contentHash mappings from a previous run
+	return s
 }
 
 // ============================================================================
@@ -149,9 +154,12 @@ func NewStore(storeOpts StoreOpts) *Store {
 
 // HasKey checks if a key exists in the store and is not expired.
 func (s *Store) HasKey(key string) bool {
-	pathKey := s.PathTransformFunc(key)
-	fullPath := pathKey.FullPath()
-	fullPathWithRoot := fmt.Sprintf("%s/%s", s.Root, fullPath)
+	contentHash, ok := s.resolveContentHash(key)
+	if !ok {
+		return false
+	}
+	pathKey := s.PathTransformFunc(contentHash)
+	fullPathWithRoot := fmt.Sprintf("%s/%s", s.Root, pathKey.FullPath())
 
 	// Check if the file exists
 	_, err := os.Stat(fullPathWithRoot)
@@ -166,12 +174,18 @@ func (s *Store) HasKey(key string) bool {
 	}
 
 	// If the meta file exists, check if it's expired
+	// If expired, delete the file and meta, and return false
 	if meta.isExpired() {
-		s.DeleteLocal(key) 
+		s.DeleteLocal(key)
 		return false
 	}
 
 	return true
+}
+
+// GetContentHash returns the SHA1 content hash for a given key (used by the HTTP API).
+func (s *Store) GetContentHash(key string) (string, bool) {
+	return s.resolveContentHash(key)
 }
 
 // Read retrieves the file associated with the given key.
@@ -184,26 +198,45 @@ func (s *Store) Write(key string, r io.Reader, ttl int64) (int64, error) {
 	return s.writeStream(key, r, ttl)
 }
 
-// WriteDecrypt stores the content from the provided reader associated with the key after decryption.
+// WriteDecrypt decrypts the incoming stream, hashes the plaintext content,
+// and stores it at the content-addressed path.
 func (s *Store) WriteDecrypt(encKey []byte, key string, r io.Reader, ttl int64) (int64, error) {
-	pathKey := s.PathTransformFunc(key)
-	pathNameWithRoot := fmt.Sprintf("%s/%s", s.Root, pathKey.PathName)
+	// Decrypt into a buffer so we can hash the plaintext before writing.
+	var decBuf bytes.Buffer
+	n, err := copyDecrypt(encKey, r, &decBuf)
+	if err != nil {
+		return 0, fmt.Errorf("error decrypting content for key %s: %w", key, err)
+	}
 
+	// Hash the decrypted (canonical) content.
+	hasher := sha1.New()
+	hasher.Write(decBuf.Bytes())
+	contentHash := hex.EncodeToString(hasher.Sum(nil))
+
+	// Derive storage path from content hash.
+	pathKey := s.PathTransformFunc(contentHash)
+	pathNameWithRoot := fmt.Sprintf("%s/%s", s.Root, pathKey.PathName)
 	if err := os.MkdirAll(pathNameWithRoot, os.ModePerm); err != nil {
 		return 0, fmt.Errorf("error creating directory %s: %w", pathNameWithRoot, err)
 	}
 
-	pathAndFilename := pathKey.FullPath()
-	fullPathAndFilenameWithRoot := fmt.Sprintf("%s/%s", s.Root, pathAndFilename)
-	f, err := os.Create(fullPathAndFilenameWithRoot)
+	fullPath := fmt.Sprintf("%s/%s", s.Root, pathKey.FullPath())
+	f, err := os.Create(fullPath)
 	if err != nil {
-		return 0, fmt.Errorf("error creating file %s: %w", fullPathAndFilenameWithRoot, err)
+		return 0, fmt.Errorf("error creating file %s: %w", fullPath, err)
 	}
 	defer f.Close()
 
-	n, err := copyDecrypt(encKey, r, f)
-	if err != nil {
-		return 0, fmt.Errorf("error copying decrypted content to file: %w", err)
+	if _, err := io.Copy(f, &decBuf); err != nil {
+		return 0, fmt.Errorf("error writing decrypted content to %s: %w", fullPath, err)
+	}
+
+	// Register key → content hash.
+	s.keyMu.Lock()
+	s.keyIndex[key] = contentHash
+	s.keyMu.Unlock()
+	if err := s.saveKeyIndex(); err != nil {
+		log.Printf("warning: failed to persist key index: %v", err)
 	}
 
 	if ttl > 0 {
@@ -212,7 +245,7 @@ func (s *Store) WriteDecrypt(encKey []byte, key string, r io.Reader, ttl int64) 
 		}
 	}
 
-	fmt.Printf("Written (%d) bytes to disk: %s\n", n, fullPathAndFilenameWithRoot)
+	fmt.Printf("Written (%d) bytes to disk: %s\n", n, fullPath)
 	return int64(n), nil
 }
 
@@ -223,7 +256,11 @@ func (s *Store) Delete(key string) error {
 
 // DeleteLocal removes the file and its metadata associated with the given key.
 func (s *Store) DeleteLocal(key string) error {
-	pathKey := s.PathTransformFunc(key)
+	contentHash, ok := s.resolveContentHash(key)
+	if !ok {
+		return nil // already gone
+	}
+	pathKey := s.PathTransformFunc(contentHash)
 
 	// Delete data file
 	dataPath := fmt.Sprintf("%s/%s", s.Root, pathKey.FullPath())
@@ -237,7 +274,15 @@ func (s *Store) DeleteLocal(key string) error {
 		return fmt.Errorf("failed to delete meta file %s: %w", metaPath, err)
 	}
 
-	log.Printf("TTL expired, key=%s", pathKey.FileName)
+	// Remove from key index
+	s.keyMu.Lock()
+	delete(s.keyIndex, key)
+	s.keyMu.Unlock()
+	if err := s.saveKeyIndex(); err != nil {
+		log.Printf("warning: failed to persist key index after deletion: %v", err)
+	}
+
+	log.Printf("deleted key=%s (hash=%s)", key, pathKey.FileName)
 	return nil
 }
 
@@ -246,28 +291,27 @@ func (s *Store) Clear() error {
 	return os.RemoveAll(s.Root)
 }
 
-// ListKeys scans the directory tree and returns keys with their expiry.
+// ListKeys returns all keys with their expiry by iterating the key index.
 func (s *Store) ListKeys() ([]KeyExpiry, error) {
-	var keys []KeyExpiry
-	err := filepath.Walk(s.Root, func(path string, info os.FileInfo, err error) error {
+	// Snapshot the keys first to avoid holding the lock during readMetaData calls.
+	s.keyMu.RLock()
+	keys := make([]string, 0, len(s.keyIndex))
+	for k := range s.keyIndex {
+		keys = append(keys, k)
+	}
+	s.keyMu.RUnlock()
+
+	var result []KeyExpiry
+	for _, key := range keys {
+		meta, err := s.readMetaData(key)
 		if err != nil {
-			return err
+			// No meta file → non-expiring
+			result = append(result, KeyExpiry{Key: key, Expiry: 0})
+		} else {
+			result = append(result, KeyExpiry{Key: key, Expiry: meta.Expiry})
 		}
-		if !info.IsDir() && !strings.HasSuffix(info.Name(), ".meta") {
-			// Assumes the filename is the key. This might need adjustment
-			// based on the actual key-to-filename mapping.
-			key := info.Name()
-			meta, err := s.readMetaData(key)
-			if err != nil {
-				// No meta file, treat as non-expiring
-				keys = append(keys, KeyExpiry{Key: key, Expiry: 0})
-			} else {
-				keys = append(keys, KeyExpiry{Key: key, Expiry: meta.Expiry})
-			}
-		}
-		return nil
-	})
-	return keys, err
+	}
+	return result, nil
 }
 
 // ============================================================================
@@ -284,11 +328,54 @@ func getDefaultRootFolder() (string, error) {
 	return fmt.Sprintf("%s/%s", dir, defaultRootFolderName), nil
 }
 
+// keyIndexPath returns the path to the persistent key-index file.
+func (s *Store) keyIndexPath() string {
+	return fmt.Sprintf("%s/_keyindex.json", s.Root)
+}
+
+// loadKeyIndex loads the key→contentHash index from disk (called on startup).
+func (s *Store) loadKeyIndex() {
+	data, err := os.ReadFile(s.keyIndexPath())
+	if err != nil {
+		return // file doesn't exist yet; start fresh
+	}
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	if err := json.Unmarshal(data, &s.keyIndex); err != nil {
+		s.keyIndex = make(map[string]string)
+	}
+}
+
+// saveKeyIndex persists the key→contentHash index to disk.
+func (s *Store) saveKeyIndex() error {
+	s.keyMu.RLock()
+	data, err := json.Marshal(s.keyIndex)
+	s.keyMu.RUnlock()
+	if err != nil {
+		return fmt.Errorf("failed to marshal key index: %w", err)
+	}
+	if err := os.MkdirAll(s.Root, os.ModePerm); err != nil {
+		return err
+	}
+	return os.WriteFile(s.keyIndexPath(), data, 0644)
+}
+
+// resolveContentHash looks up the SHA1 content hash for a user-supplied key.
+func (s *Store) resolveContentHash(key string) (string, bool) {
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
+	hash, ok := s.keyIndex[key]
+	return hash, ok
+}
+
 // readStream opens a stream for reading the file associated with the key.
 func (s *Store) readStream(key string) (int64, io.ReadCloser, error) {
-	pathKey := s.PathTransformFunc(key)
-	pathAndFilename := pathKey.FullPath()
-	fullPathWithRoot := fmt.Sprintf("%s/%s", s.Root, pathAndFilename)
+	contentHash, ok := s.resolveContentHash(key)
+	if !ok {
+		return 0, nil, fmt.Errorf("key not found: %s", key)
+	}
+	pathKey := s.PathTransformFunc(contentHash)
+	fullPathWithRoot := fmt.Sprintf("%s/%s", s.Root, pathKey.FullPath())
 
 	fi, err := os.Stat(fullPathWithRoot)
 	if err != nil {
@@ -303,25 +390,44 @@ func (s *Store) readStream(key string) (int64, io.ReadCloser, error) {
 }
 
 // writeStream writes the content from the provided reader associated with the key.
+// It buffers the full content, computes its SHA1 hash, and stores the file at the
+// content-addressed path, registering the key→hash mapping in the key index.
 func (s *Store) writeStream(key string, r io.Reader, ttl int64) (int64, error) {
-	pathKey := s.PathTransformFunc(key)
+	// Buffer content while simultaneously feeding it to the SHA1 hasher.
+	var buf bytes.Buffer
+	hasher := sha1.New()
+	tee := io.TeeReader(r, &buf) // every byte read from tee is also written to buf
+	if _, err := io.Copy(hasher, tee); err != nil {
+		return 0, fmt.Errorf("error buffering content for key %s: %w", key, err)
+	}
+	contentHash := hex.EncodeToString(hasher.Sum(nil))
+
+	// Derive the storage path from the content hash (not the key).
+	pathKey := s.PathTransformFunc(contentHash)
 	pathNameWithRoot := fmt.Sprintf("%s/%s", s.Root, pathKey.PathName)
 
 	if err := os.MkdirAll(pathNameWithRoot, os.ModePerm); err != nil {
 		return 0, fmt.Errorf("error creating directory %s: %w", pathNameWithRoot, err)
 	}
 
-	pathAndFilename := pathKey.FullPath()
-	fullPathAndFilenameWithRoot := fmt.Sprintf("%s/%s", s.Root, pathAndFilename)
-	f, err := os.Create(fullPathAndFilenameWithRoot)
+	fullPath := fmt.Sprintf("%s/%s", s.Root, pathKey.FullPath())
+	f, err := os.Create(fullPath)
 	if err != nil {
-		return 0, fmt.Errorf("error creating file %s: %w", fullPathAndFilenameWithRoot, err)
+		return 0, fmt.Errorf("error creating file %s: %w", fullPath, err)
 	}
 	defer f.Close()
 
-	n, err := io.Copy(f, r)
+	n, err := io.Copy(f, &buf)
 	if err != nil {
-		return 0, fmt.Errorf("error writing to file %s: %w", fullPathAndFilenameWithRoot, err)
+		return 0, fmt.Errorf("error writing to file %s: %w", fullPath, err)
+	}
+
+	// Register key → content hash so lookups can find the file.
+	s.keyMu.Lock()
+	s.keyIndex[key] = contentHash
+	s.keyMu.Unlock()
+	if err := s.saveKeyIndex(); err != nil {
+		log.Printf("warning: failed to persist key index: %v", err)
 	}
 
 	if ttl > 0 {
@@ -335,7 +441,11 @@ func (s *Store) writeStream(key string, r io.Reader, ttl int64) (int64, error) {
 
 // readMetaData reads and returns the metadata for a key.
 func (s *Store) readMetaData(key string) (*MetaData, error) {
-	pathKey := s.PathTransformFunc(key)
+	contentHash, ok := s.resolveContentHash(key)
+	if !ok {
+		return nil, fmt.Errorf("key not found in index: %s", key)
+	}
+	pathKey := s.PathTransformFunc(contentHash)
 	metaPath := fmt.Sprintf("%s/%s", s.Root, pathKey.MetaPath())
 
 	data, err := os.ReadFile(metaPath)
@@ -353,7 +463,11 @@ func (s *Store) readMetaData(key string) (*MetaData, error) {
 
 // writeMetaData writes metadata for a key with an expiry time.
 func (s *Store) writeMetaData(key string, expiry int64) error {
-	pathKey := s.PathTransformFunc(key)
+	contentHash, ok := s.resolveContentHash(key)
+	if !ok {
+		return fmt.Errorf("key not found in index: %s", key)
+	}
+	pathKey := s.PathTransformFunc(contentHash)
 	metaPath := fmt.Sprintf("%s/%s", s.Root, pathKey.MetaPath())
 
 	meta := MetaData{Expiry: expiry}
