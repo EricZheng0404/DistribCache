@@ -1,0 +1,26 @@
+# Git
+.git
+.gitignore
+
+# Local network data directories (created at runtime; not part of the image)
+:3000_network/
+:4000_network/
+:3001_network/
+:3002_network/
+:3003_network/
+:3004_network/
+:3005_network/
+:3006_network/
+:3007_network/
+:3008_network/
+:4001_network/
+*_network/
+
+# Test binaries / coverage
+*.test
+*.out
+coverage.html
+
+# OS noise
+.DS_Store
+Thumbs.db
